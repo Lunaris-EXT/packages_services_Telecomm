@@ -47,6 +47,8 @@ import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.telecom.Log;
+import android.content.ContentResolver;
+import android.provider.Settings;
 import android.telecom.TelecomManager;
 import android.util.Pair;
 import android.view.accessibility.AccessibilityManager;
@@ -54,8 +56,6 @@ import android.view.accessibility.AccessibilityManager;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.telecom.LogUtils.EventTimer;
 import com.android.server.telecom.flags.FeatureFlags;
-
-import lineageos.providers.LineageSettings;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -549,12 +549,12 @@ public class Ringer {
                     if (DEBUG_RINGER) {
                         Log.i(this, "Create ringer with custom vibration effect");
                     }
-                    if (LineageSettings.System.getInt(mContext.getContentResolver(),
-                            LineageSettings.System.INCREASING_RING, 0) != 0) {
-                        float startVolume = LineageSettings.System.getFloat(mContext.getContentResolver(),
-                                LineageSettings.System.INCREASING_RING_START_VOLUME, 0.1f);
-                        int rampUpTime = LineageSettings.System.getInt(mContext.getContentResolver(),
-                                LineageSettings.System.INCREASING_RING_RAMP_UP_TIME, 20);
+                    if (getLineageSystemInt(mContext.getContentResolver(),
+                            "increasing_ring", 0) != 0) {
+                        float startVolume = getLineageSystemFloat(mContext.getContentResolver(),
+                                "increasing_ring_start_vol", 0.1f);
+                        int rampUpTime = getLineageSystemInt(mContext.getContentResolver(),
+                                "increasing_ring_ramp_up_time", 20);
                         mVolumeShaperConfig =
                                 new VolumeShaper.Configuration.Builder()
                                         .setDuration(rampUpTime * 1000)
@@ -782,7 +782,7 @@ public class Ringer {
         stopRinging();
 
         if (Settings.System.getIntForUser(mContext.getContentResolver(),
-                Settings.System.VIBRATE_ON_CALLWAITING, 0, UserHandle.USER_CURRENT) == 1) {
+                Settings.System.VIBRATE_ON_CALLWAITING, 0, UserHandle.CURRENT.getIdentifier()) == 1) {
             vibrate(200, 300, 500);
         }
 
@@ -1140,5 +1140,27 @@ public class Ringer {
             mVibrator.vibrate(
                 VibrationEffect.createWaveform(pattern, -1), VIBRATION_INCALL_ATTRIBUTES);
         }
+    }
+
+    private static int getLineageSystemInt(ContentResolver cr, String name, int def) {
+        try {
+            android.os.Bundle b = cr.call(android.net.Uri.parse("content://lineageos.settings/system"), "GET_system", name, null);
+            if (b != null) {
+                String val = b.getString("value");
+                return val != null ? Integer.parseInt(val) : def;
+            }
+        } catch (Exception ignored) {}
+        return def;
+    }
+
+    private static float getLineageSystemFloat(ContentResolver cr, String name, float def) {
+        try {
+            android.os.Bundle b = cr.call(android.net.Uri.parse("content://lineageos.settings/system"), "GET_system", name, null);
+            if (b != null) {
+                String val = b.getString("value");
+                return val != null ? Float.parseFloat(val) : def;
+            }
+        } catch (Exception ignored) {}
+        return def;
     }
 }

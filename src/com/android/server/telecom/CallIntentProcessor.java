@@ -280,32 +280,6 @@ public class CallIntentProcessor {
     }
 
     /**
-     * Determines if the {@link RoleManager} for the specified user has a role holder for the dialer
-     * role.
-     * @param context the context.
-     * @param user the user to check.
-     * @return {@code true} if the dialer role is held by a valid apk that meets the requirements of
-     * being a dialer app, {@code false} otherwise.
-     */
-    private static boolean doesUserHaveDialerRoleHolder(Context context, UserHandle user) {
-        Context userContext = context.createContextAsUser(user, 0);
-        RoleManager roleManager = userContext.getSystemService(RoleManager.class);
-        List<String> roleHolders = roleManager.getRoleHolders(RoleManager.ROLE_DIALER);
-        if (roleHolders == null || roleHolders.isEmpty()) {
-            return false;
-        }
-
-        String dialerPackage = roleHolders.get(0);
-        try {
-            ApplicationInfo info = userContext.getPackageManager()
-                    .getApplicationInfo(dialerPackage, 0);
-            return info.enabled;
-        } catch (PackageManager.NameNotFoundException e) {
-            return false;
-        }
-    }
-
-    /**
      * If the call is initiated from managed profile but there is no work dialer installed, treat
      * the call is initiated from its parent user.
      *
