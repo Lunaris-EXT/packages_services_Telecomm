@@ -781,8 +781,8 @@ public class Ringer {
 
         stopRinging();
 
-        if (Settings.System.getIntForUser(mContext.getContentResolver(),
-                "vibrate_on_callwaiting", 0, UserHandle.CURRENT.getIdentifier()) == 1) {
+        if (Settings.System.getInt(mContext.getContentResolver(),
+                "vibrate_on_callwaiting", 0) == 1) {
             vibrate(200, 300, 500);
         }
 
