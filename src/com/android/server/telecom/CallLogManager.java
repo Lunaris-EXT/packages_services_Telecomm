@@ -27,17 +27,16 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
-import android.location.Country;
-import android.location.CountryDetector;
 import android.location.Location;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.HandlerExecutor;
+import android.os.IBinder;
 import android.os.Looper;
-import android.os.UserHandle;
 import android.os.PersistableBundle;
+import android.os.RemoteException;
+import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.CallLog;
 import android.provider.CallLog.Calls;
@@ -51,10 +50,12 @@ import android.telecom.VideoProfile;
 import android.telephony.CarrierConfigManager;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 import android.util.Pair;
 import android.text.TextUtils;
 
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.modules.utils.HandlerExecutor;
 import com.android.server.telecom.callfiltering.CallFilteringResult;
 import com.android.server.telecom.flags.FeatureFlags;
 import com.android.server.telecom.flags.Flags;
@@ -127,10 +128,9 @@ public final class CallLogManager extends CallsManagerListenerBase {
     private static final String CALL_DURATION = "duration";
 
     private final Object mLock = new Object();
-    private Country mCurrentCountry;
     private String mCurrentCountryIso;
     private HandlerExecutor mCountryCodeExecutor;
-    private SensitivePhoneNumbers mSensitivePhoneNumbers;
+    private ISensitivePhoneNumbers mSensitivePhoneNumbers;
 
     private final FeatureFlags mFeatureFlags;
 
@@ -145,7 +145,7 @@ public final class CallLogManager extends CallsManagerListenerBase {
         mAnomalyReporterAdapter = anomalyReporterAdapter;
         mCountryCodeExecutor = new HandlerExecutor(new Handler(Looper.getMainLooper()));
         mFeatureFlags = featureFlags;
-        mSensitivePhoneNumbers = SensitivePhoneNumbers.getInstance();
+        mSensitivePhoneNumbers = getSensitivePhoneNumbersService();
     }
 
     @Override
@@ -160,6 +160,10 @@ public final class CallLogManager extends CallsManagerListenerBase {
         }
 
         if (shouldLogDisconnectedCall(call, oldState, isCallCanceled)) {
+            Log.i(this, "onCallStateChanged: call=%s, newState=%s, disconnectCause=%s",
+                    call.getId(),
+                    CallState.toString(newState),
+                    DisconnectCause.disconnectCodeToString(disconnectCause));
             int type;
             if (!call.isIncoming()) {
                 type = Calls.OUTGOING_TYPE;
@@ -172,6 +176,7 @@ public final class CallLogManager extends CallsManagerListenerBase {
             } else {
                 type = Calls.INCOMING_TYPE;
             }
+
             // Always show the notification for managed calls. For self-managed calls, it is up to
             // the app to show the notification, so suppress the notification when logging the call.
             boolean showNotification = call.isManaged();
@@ -186,12 +191,8 @@ public final class CallLogManager extends CallsManagerListenerBase {
     void logCallIfNotSelfManaged (Call call, int type, boolean showNotificationForMissedCall,
             CallFilteringResult result) {
         boolean shouldCallSelfManagedLogged = shouldLogVoipCall(call);
-        if (!mFeatureFlags.preventSelfManagedCallLogging() || call.isManaged() ||
-                shouldCallSelfManagedLogged) {
+        if (call.isManaged() || shouldCallSelfManagedLogged) {
             logCall(call, type, showNotificationForMissedCall, result);
-        } else {
-            Log.d(TAG, "logCallIfNotSelfManaged: skipping call logging due to self managed "
-                    + "for call = " + call);
         }
     }
 
@@ -327,7 +328,7 @@ public final class CallLogManager extends CallsManagerListenerBase {
             @Nullable LogCallCompletedListener logCallCompletedListener, CallFilteringResult result) {
         // If the call has already been logged, do not log it again. This is an atomic check-and-set
         // to prevent race conditions from multiple disconnect events.
-        if (mFeatureFlags.avoidLoggingMoreThanOnce() && call.getAndSetHasBeenLogged()) {
+        if (call.getAndSetHasBeenLogged()) {
             Log.i(TAG, "LogCall: skipping already-logged call: %s", call.getId());
             return;
         }
@@ -373,7 +374,10 @@ public final class CallLogManager extends CallsManagerListenerBase {
                 (call.getConnectionProperties() & Connection.PROPERTY_ASSISTED_DIALING) ==
                         Connection.PROPERTY_ASSISTED_DIALING,
                 call.wasEverRttCall(),
-                call.wasVolte()));
+                call.wasVolte(),
+                call.wasVonr(),
+                call.isHdPlus(),
+                call.isGroupCall(), mFeatureFlags));
 
         if (result == null) {
             result = new CallFilteringResult.Builder()
@@ -394,7 +398,7 @@ public final class CallLogManager extends CallsManagerListenerBase {
         if (phoneAccount != null &&
                 phoneAccount.hasCapabilities(PhoneAccount.CAPABILITY_MULTI_USER)) {
             if (initiatingUser != null &&
-                    UserUtil.isProfile(mContext, initiatingUser, mFeatureFlags)) {
+                    UserUtil.isProfile(mContext, initiatingUser)) {
                 paramBuilder.setUserToBeInsertedTo(initiatingUser);
                 paramBuilder.setAddForAllUsers(false);
             } else {
@@ -469,17 +473,19 @@ public final class CallLogManager extends CallsManagerListenerBase {
         // At this point, we have already checked to see if we should log a transactional call.
         if (mFeatureFlags.integratedCallLogs() && call.isTransactionalCall()) {
             paramBuilder.setUuid(call.getId());
-            if (isCallerDisplayPresent) {
+            if (isCallerDisplayPresent && callerInfo != null) {
                 callerInfo.setName(call.getCallerDisplayName());
+            }
+            // Sets the VoIP contact lookup uri.
+            if (android.telecom.flags.Flags.integratedCallLogsStage2()) {
+                paramBuilder.setVoipContactLookupUri(call.getVoipContactLookupUri());
             }
         }
         // A little different from the above logic to set the caller info name to the caller display
         // name as that field is used for populating the CACHED_NAME column in the call log, which
         // may be overwritten if a contact exists.
         if (mFeatureFlags.supportDisplayNameCallLog()) {
-            String preferredName = isCallerDisplayPresent
-                    ? call.getCallerDisplayName()
-                    : (callerInfo != null ? callerInfo.cnapName : "");
+            String preferredName = getPreferredName(call, isCallerDisplayPresent, callerInfo);
             paramBuilder.setPreferredDisplayName(preferredName);
             String name = callerInfo != null ? callerInfo.getName() : "";
             Log.w(TAG, "Call display name details - [display name: %s, preferred display name: %s]",
@@ -496,11 +502,29 @@ public final class CallLogManager extends CallsManagerListenerBase {
                     logCallCompletedListener, call);
             Log.addEvent(call, LogUtils.Events.LOG_CALL, "number=" + Log.piiHandle(logNumber)
                     + ",postDial=" + Log.piiHandle(call.getPostDialDigits()) + ",pres="
-                    + call.getHandlePresentation());
+                    + call.getHandlePresentation()
+                    + ",code=" + DisconnectCause.disconnectCodeToString(
+                            call.getDisconnectCause().getCode()));
             logCallAsync(args);
         } else {
             Log.addEvent(call, LogUtils.Events.SKIP_CALL_LOG);
         }
+    }
+
+    private static String getPreferredName(Call call, boolean isCallerDisplayPresent,
+        CallerInfo callerInfo) {
+        if (isCallerDisplayPresent) {
+            if (call.getCallerDisplayNamePresentation() == TelecomManager.PRESENTATION_ALLOWED) {
+                return call.getCallerDisplayName();
+            }
+            Log.w(TAG, "Clearing caller display name due to presentation restriction");
+        } else if (callerInfo != null) {
+            if (callerInfo.namePresentation == TelecomManager.PRESENTATION_ALLOWED) {
+                return callerInfo.cnapName;
+            }
+            Log.w(TAG, "Clearing cnapName due to presentation restriction");
+        }
+        return "";
     }
 
     boolean okayToLogCall(PhoneAccountHandle accountHandle, String number, boolean isEmergency) {
@@ -519,12 +543,50 @@ public final class CallLogManager extends CallsManagerListenerBase {
         }
 
         // Don't log sensitive numbers.
-        boolean isSensitiveNumber = mSensitivePhoneNumbers.isSensitiveNumber(mContext, number,
-                subId);
+        boolean isSensitiveNumber = isSensitiveNumber(number, subId);
 
         // Don't log emergency numbers if the device doesn't allow it.
         return (!isEmergency || okToLogEmergencyNumber)
                 && !isUnloggableNumber(number, configBundle) && !isSensitiveNumber;
+    }
+
+    private ISensitivePhoneNumbers getSensitivePhoneNumbersService() {
+        if (mSensitivePhoneNumbers == null) {
+            IBinder b = getServiceBinder(ISensitivePhoneNumbers.SERVICE_NAME);
+            if (b != null) {
+                try {
+                    b.linkToDeath(() -> mSensitivePhoneNumbers = null, 0);
+                } catch (RemoteException e) {
+                    Log.w(this, "Failed to link to death on SensitivePhoneNumbersService: %s", e);
+                }
+                mSensitivePhoneNumbers = ISensitivePhoneNumbers.Stub.asInterface(b);
+            }
+        }
+        return mSensitivePhoneNumbers;
+    }
+
+    private static IBinder getServiceBinder(String name) {
+        try {
+            return (IBinder) Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String.class)
+                    .invoke(null, name);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private boolean isSensitiveNumber(String number, int subId) {
+        ISensitivePhoneNumbers service = getSensitivePhoneNumbersService();
+        if (service == null) {
+            return false;
+        }
+        try {
+            return service.isSensitiveNumber(number, subId);
+        } catch (RemoteException e) {
+            Log.e(this, e, "Failed to check sensitive phone number");
+            mSensitivePhoneNumbers = null;
+            return false;
+        }
     }
 
     private boolean isUnloggableNumber(String callNumber, PersistableBundle carrierConfig) {
@@ -533,13 +595,8 @@ public final class CallLogManager extends CallsManagerListenerBase {
                 : carrierConfig.getStringArray(
                         CarrierConfigManager.KEY_UNLOGGABLE_NUMBERS_STRING_ARRAY);
         String[] unloggableNumbersFromMccConfig;
-        if (mFeatureFlags.resolveHiddenDependenciesTwo()) {
-            unloggableNumbersFromMccConfig = mContext.getResources()
-                    .getStringArray(com.android.server.telecom.R.array.unloggable_phone_numbers);
-        } else {
-            unloggableNumbersFromMccConfig = mContext.getResources()
-                    .getStringArray(com.android.internal.R.array.unloggable_phone_numbers);
-        }
+        unloggableNumbersFromMccConfig = TelecomResourceId.getStringArray(mContext,
+                "unloggable_phone_numbers");
         return Stream.concat(
                 unloggableNumbersFromCarrierConfig == null ?
                         Stream.empty() : Arrays.stream(unloggableNumbersFromCarrierConfig),
@@ -556,10 +613,13 @@ public final class CallLogManager extends CallsManagerListenerBase {
      * @param isStoreHd {@code true} if this call was used HD.
      * @param isWifi {@code true} if this call was used wifi.
      * @param isUsingAssistedDialing {@code true} if this call used assisted dialing.
+     * @param isHdPlus {@code true} if this is call audio quality is HD+
+     * @param featureFlags Feature flags.
      * @return The call features.
      */
     private static int getCallFeatures(int videoState, boolean isPulledCall, boolean isStoreHd,
-            boolean isWifi, boolean isUsingAssistedDialing, boolean isRtt, boolean isVolte) {
+            boolean isWifi, boolean isUsingAssistedDialing, boolean isRtt, boolean isVolte,
+            boolean isVonr, boolean isHdPlus, boolean isGroupCall, FeatureFlags featureFlags) {
         int features = 0;
         if (VideoProfile.isVideo(videoState)) {
             features |= Calls.FEATURES_VIDEO;
@@ -582,6 +642,16 @@ public final class CallLogManager extends CallsManagerListenerBase {
         if (isVolte) {
             features |= Calls.FEATURES_VOLTE;
         }
+        if (featureFlags.hdPlusCall() && isVonr) {
+            features |= Calls.FEATURES_VONR;
+        }
+        if (featureFlags.hdPlusCall() && isHdPlus) {
+            features |= Calls.FEATURES_HD_PLUS_CALL;
+        }
+        if (isGroupCall) {
+            features |= Calls.FEATURES_GROUP_CALL;
+        }
+
         return features;
     }
 
@@ -605,7 +675,7 @@ public final class CallLogManager extends CallsManagerListenerBase {
         if (TextUtils.isEmpty(handleString) && (PhoneAccount.SCHEME_VOICEMAIL.equals(scheme))) {
             // This is a voicemail.Get voicemail number for this voicemail call.
             final PhoneAccountHandle accountHandle = call.getTargetPhoneAccount();
-            TelecomManager tm = TelecomManager.from(mContext);
+            TelecomManager tm = mContext.getSystemService(TelecomManager.class);
             if (tm != null) {
                 handleString = tm.getVoiceMailNumber(accountHandle);
             }
@@ -703,16 +773,6 @@ public final class CallLogManager extends CallsManagerListenerBase {
                 PERMISSION_PROCESS_CALLLOG_INFO);
     }
 
-    private String getCountryIsoFromCountry(Country country) {
-        if(country == null) {
-            // Fallback to Locale if there are issues with CountryDetector
-            Log.w(TAG, "Value for country was null. Falling back to Locale.");
-            return Locale.getDefault().getCountry();
-        }
-
-        return country.getCountryCode();
-    }
-
     /**
      * Get the current country code
      *
@@ -725,30 +785,46 @@ public final class CallLogManager extends CallsManagerListenerBase {
                 // up, causing a RemoteException to be thrown. Note that the callback is only
                 // registered if the country iso cache is null (so in an ideal setting, this should
                 // only require a one-time configuration).
-                final CountryDetector countryDetector =
+                /*final CountryDetector countryDetector =
                         (CountryDetector) mContext.getSystemService(Context.COUNTRY_DETECTOR);
                 if (countryDetector != null) {
                     countryDetector.registerCountryDetectorCallback(
                             mCountryCodeExecutor, this::countryCodeConsumer);
-                }
-                mCurrentCountryIso = getCountryIsoFromCountry(mCurrentCountry);
+                }*/
+                mCurrentCountryIso = getCurrentCountryIso(mContext);
             }
             return mCurrentCountryIso;
         }
     }
 
-    /** Consumer to receive the country code if it changes. */
-    private void countryCodeConsumer(Country newCountry) {
-        Log.startSession("CLM.cCC");
+    /**
+     * Retrieves the current country ISO code. It first tries to get the network country ISO,
+     * then the SIM country ISO, and finally falls back to the default locale's country.
+     *
+     * @param context The current context.
+     * @return The ISO 3166-1 two-letter country code of the current country, or {@code null} if
+     *         it cannot be determined. The returned string is in uppercase.
+     */
+    private String getCurrentCountryIso(Context context) {
+        String countryIso = null;
+        TelephonyManager tm = context.getSystemService(TelephonyManager.class);
         try {
-            Log.i(TAG, "Country ISO changed. Retrieving new ISO...");
-            synchronized (mLock) {
-                mCurrentCountry = newCountry;
-                mCurrentCountryIso = getCountryIsoFromCountry(newCountry);
+            if (tm != null) {
+                countryIso = tm.getNetworkCountryIso();
+                if (TextUtils.isEmpty(countryIso)) {
+                    countryIso = tm.getSimCountryIso();
+                }
             }
-        } finally {
-            Log.endSession();
+        } catch (UnsupportedOperationException e) {
+            // Telecom can run on devices without FEATURE_TELEPHONY_CALLING, in which case
+            // TelephonyManager methods will throw UnsupportedOperationException.
+            // The Logic falls back to Locale
+            Log.w(TAG, "getCurrentCountryIso: TelephonyManager methods failed: " + e.getMessage());
         }
+        if (TextUtils.isEmpty(countryIso)) {
+            countryIso = Locale.getDefault().getCountry();
+        }
+        return countryIso != null ? countryIso.toUpperCase(Locale.US) : null;
     }
 
     @VisibleForTesting

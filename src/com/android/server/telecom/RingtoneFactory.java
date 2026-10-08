@@ -19,8 +19,8 @@ package com.android.server.telecom;
 import android.annotation.Nullable;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.content.pm.UserInfo;
 import android.media.AudioAttributes;
+import android.media.audio.Flags;
 import android.media.RingtoneManager;
 import android.media.Ringtone;
 import android.media.VolumeShaper;
@@ -30,7 +30,7 @@ import android.os.UserManager;
 import android.provider.Settings;
 
 import android.telecom.Log;
-import android.telephony.SubscriptionManager;
+import android.telecom.PhoneAccountHandle;
 import android.text.TextUtils;
 
 import com.android.internal.annotations.VisibleForTesting;
@@ -99,21 +99,40 @@ public class RingtoneFactory {
                     ? userContext : mContext;
 
             UserManager um = contextToUse.getSystemService(UserManager.class);
-            boolean isUserUnlocked = mFeatureFlags.telecomResolveHiddenDependencies()
-                    ? um.isUserUnlocked(contextToUse.getUser())
-                    : um.isUserUnlocked(contextToUse.getUserId());
+            boolean isUserUnlocked = um.isUserUnlocked(contextToUse.getUser());
+            final PhoneAccountHandle accountHandle = incomingCall.getTargetPhoneAccount();
             Uri defaultRingtoneUri;
             if (isUserUnlocked) {
-                defaultRingtoneUri = RingtoneManager.getActualDefaultRingtoneUriBySlot(
-                        contextToUse, RingtoneManager.TYPE_RINGTONE, phoneId);
+                if (Flags.supportPerPhoneAccountRingtone()) {
+                    defaultRingtoneUri = RingtoneManager.getRingtoneUriForPhoneAccountHandle(
+                            contextToUse, accountHandle);
+                } else {
+                    defaultRingtoneUri = RingtoneManager.getActualDefaultRingtoneUri(contextToUse,
+                            RingtoneManager.TYPE_RINGTONE);
+                }
                 if (defaultRingtoneUri == null) {
                     Log.i(this, "getRingtone: defaultRingtoneUri for user is null.");
                 }
             } else {
-                defaultRingtoneUri = phoneId == 1 ? Settings.System.DEFAULT_RINGTONE2_URI
-                        : Settings.System.DEFAULT_RINGTONE_URI;
-                if (defaultRingtoneUri == null) {
-                    Log.i(this, "getRingtone: Settings.System.DEFAULT_RINGTONE_URI is null.");
+                if (Flags.supportPerPhoneAccountRingtone()) {
+                    defaultRingtoneUri = accountHandle != null
+                            ? Settings.System.DEFAULT_RINGTONE_URI.buildUpon()
+                            .appendQueryParameter(
+                                    RingtoneManager.PHONE_ACCOUNT_HANDLE_COMPONENT_NAME,
+                                    accountHandle.getComponentName().flattenToShortString())
+                            .appendQueryParameter(
+                                    RingtoneManager.PHONE_ACCOUNT_HANDLE_ID,
+                                    accountHandle.getId())
+                            .appendQueryParameter(
+                                    RingtoneManager.PHONE_ACCOUNT_HANDLE_USER_HANDLE,
+                                    String.valueOf(accountHandle.getUserHandle().hashCode()))
+                            .build()
+                            : Settings.System.DEFAULT_RINGTONE_URI;
+                } else {
+                    defaultRingtoneUri = Settings.System.DEFAULT_RINGTONE_URI;
+                    if (defaultRingtoneUri == null) {
+                        Log.i(this, "getRingtone: Settings.System.DEFAULT_RINGTONE_URI is null.");
+                    }
                 }
             }
 
@@ -165,28 +184,18 @@ public class RingtoneFactory {
                 ? userContext.getSystemService(UserManager.class)
                 : mContext.getSystemService(UserManager.class);
         List<UserHandle> profiles = um.getUserProfiles();
-        List<UserInfo> userInfoProfiles = um.getEnabledProfiles(userHandle.getIdentifier());
         UserHandle workProfileUser = null;
         int managedProfileCount = 0;
 
-        if (mFeatureFlags.telecomResolveHiddenDependencies()) {
-            for (UserHandle profileUser : profiles) {
-                UserManager userManager = mContext.createContextAsUser(profileUser, 0)
-                        .getSystemService(UserManager.class);
-                if (!userHandle.equals(profileUser) && userManager.isManagedProfile()) {
-                    managedProfileCount++;
-                    workProfileUser = profileUser;
-                }
-            }
-        } else {
-            for(UserInfo profile: userInfoProfiles) {
-                UserHandle profileUserHandle = profile.getUserHandle();
-                if (!profileUserHandle.equals(userHandle) && profile.isManagedProfile()) {
-                    managedProfileCount++;
-                    workProfileUser = profileUserHandle;
-                }
+        for (UserHandle profileUser : profiles) {
+            UserManager userManager = mContext.createContextAsUser(profileUser, 0)
+                    .getSystemService(UserManager.class);
+            if (!userHandle.equals(profileUser) && userManager.isManagedProfile()) {
+                managedProfileCount++;
+                workProfileUser = profileUser;
             }
         }
+
         // There may be many different types of profiles, so only count Managed (Work) Profiles.
         if(managedProfileCount == 1) {
             return getContextForUserHandle(workProfileUser);
@@ -212,16 +221,8 @@ public class RingtoneFactory {
         if(userContext == null) {
             return false;
         }
-        String ringtoneSetting = phoneId == 1 ? Settings.System.RINGTONE2
-                : Settings.System.RINGTONE;
-        if (mFeatureFlags.resolveHiddenDependenciesTwo()) {
-            return !TextUtils.isEmpty(Settings.System.getString(userContext.getContentResolver(),
-                    ringtoneSetting));
-        } else {
-            return !TextUtils.isEmpty(Settings.System.getStringForUser(
-                    userContext.getContentResolver(), ringtoneSetting,
-                    UserUtil.getUserIdFromContext(userContext, mFeatureFlags)));
-        }
+        return !TextUtils.isEmpty(Settings.System.getString(userContext.getContentResolver(),
+                Settings.System.RINGTONE));
     }
 
     private boolean isWorkContact(Call incomingCall) {

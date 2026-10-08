@@ -18,7 +18,6 @@ package com.android.server.telecom;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AppOpsManager;
 import android.app.BroadcastOptions;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -216,7 +215,8 @@ public class NewOutgoingCallIntentBroadcaster {
                 if (!mIsDefaultOrSystemPhoneApp) {
                     Log.w(this,
                             "Potentially dangerous MMI code %s with CALL Intent %s can only be "
-                                    + "sent if caller is the system or default dialer",
+                                    + "sent if caller is the system or default dialer "
+                                    + "(and not trampolined).",
                             number, intent);
                     launchSystemDialer(intent.getData());
                     result.disconnectCause = DisconnectCause.OUTGOING_CANCELED;
@@ -285,13 +285,14 @@ public class NewOutgoingCallIntentBroadcaster {
                             false),
                     mIntent.getIntExtra(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE,
                             VideoProfile.STATE_AUDIO_ONLY), mFeatureFlags);
-            /**
+            /*
              * If there is an available {@link android.telecom.CallRedirectionService}, use the
              * {@link CallRedirectionProcessor} to perform call redirection instead of using
              * broadcasting.
              */
             callRedirectionWithService = callRedirectionProcessor
                     .canMakeCallRedirectionWithServiceAsUser(mCall.getAssociatedUser());
+            Log.i(this, "processCall: callRedirectionWithService = %s", callRedirectionProcessor);
             if (callRedirectionWithService) {
                 callRedirectionProcessor.performCallRedirection(mCall.getAssociatedUser());
             }
@@ -351,18 +352,10 @@ public class NewOutgoingCallIntentBroadcaster {
         broadcastIntent.addFlags(Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND);
         Log.i(this, "broadcastIntent: Sending non-blocking for %s to %s", mCall.getId(),
                 targetUser);
-        if (mFeatureFlags.telecomResolveHiddenDependencies()) {
-            mContext.sendBroadcastAsUser(
-                    broadcastIntent,
-                    targetUser,
-                    Manifest.permission.PROCESS_OUTGOING_CALLS);
-        } else {
-            mContext.sendBroadcastAsUser(
-                    broadcastIntent,
-                    targetUser,
-                    android.Manifest.permission.PROCESS_OUTGOING_CALLS,
-                    AppOpsManager.OP_PROCESS_OUTGOING_CALLS);  // initialExtras
-        }
+        mContext.sendBroadcastAsUser(
+                broadcastIntent,
+                targetUser,
+                Manifest.permission.PROCESS_OUTGOING_CALLS);
     }
 
     /**
