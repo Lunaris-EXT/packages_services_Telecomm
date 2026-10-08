@@ -95,7 +95,7 @@ public class RingtoneFactory {
             // ringtone for user or profile.
             int subId = mCallsManager.getPhoneAccountRegistrar()
                     .getSubscriptionIdForPhoneAccount(incomingCall.getTargetPhoneAccount());
-            int phoneId = SubscriptionManager.getPhoneId(subId);
+            int phoneId = SubscriptionManager.getSlotIndex(subId);
             Context contextToUse = hasDefaultRingtoneForUserBySlot(userContext, phoneId)
                     ? userContext : mContext;
 
